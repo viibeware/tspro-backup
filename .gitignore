@@ -7,5 +7,5 @@ temp/
 *.db
 *.key
 
-# Internal security audit — documents still-open findings; don't publish it.
-SECURITY_AUDIT.md
+# Internal security audits — document still-open findings; never publish.
+SECURITY_AUDIT*.md

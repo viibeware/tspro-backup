@@ -25,6 +25,7 @@ import threading
 import time
 from datetime import datetime, timedelta
 from functools import wraps
+from urllib.parse import urlsplit
 
 from flask import (Blueprint, current_app, g, jsonify, request, send_file)
 from sqlalchemy import func
@@ -93,13 +94,36 @@ def _staged_bytes(staging):
     return total
 
 
-def _capacity_error(site, incoming_bytes):
+# One lock per in-flight (site, upload_id): serializes the save-then-check
+# sequence in upload_chunk (concurrent chunk POSTs would otherwise all pass a
+# stale free-space read) and makes finalize single-shot per upload.
+_upload_locks = {}
+_upload_locks_guard = threading.Lock()
+
+
+def _upload_lock(site_id, upload_id):
+    key = (site_id, upload_id)
+    with _upload_locks_guard:
+        lock = _upload_locks.get(key)
+        if lock is None:
+            lock = _upload_locks[key] = threading.Lock()
+        return lock
+
+
+def _drop_upload_lock(site_id, upload_id):
+    with _upload_locks_guard:
+        _upload_locks.pop((site_id, upload_id), None)
+
+
+def _capacity_error(site, incoming_bytes, disk_bytes=None):
     """Return (message, status) if storing ``incoming_bytes`` more would breach
     free-disk headroom or this site's quota, else None. Prevents one site key
-    from filling the volume."""
+    from filling the volume. ``disk_bytes`` overrides the free-space estimate
+    when peak on-disk usage exceeds the logical size (e.g. finalize briefly
+    holds staging + reassembled tmp + stored copy at once)."""
     try:
         free = shutil.disk_usage(current_app.config["DATA_DIR"]).free
-        if free < incoming_bytes + _DISK_MARGIN_BYTES:
+        if free < (disk_bytes if disk_bytes is not None else incoming_bytes) + _DISK_MARGIN_BYTES:
             return ("server is low on disk space; try again later", 507)
     except OSError:
         pass
@@ -133,17 +157,44 @@ def _reap_stale_chunks(base, ttl_seconds):
         pass
 
 
+# Upload-staging / at-rest-decrypt temp files older than this are orphans
+# (their request thread is long dead — the worker timeout is 600 s) and get
+# swept by the reaper. A SIGKILLed download otherwise strands a plaintext
+# copy of the archive in <DATA_DIR>/tmp forever.
+_TMP_TTL_SECONDS = int(os.environ.get("TSPB_TMP_TTL_MINUTES", "60")) * 60
+
+
+def _reap_stale_tmp(tmp_base, ttl_seconds):
+    """Drop orphaned transfer temp files (worker killed mid-request)."""
+    cutoff = time.time() - ttl_seconds
+    try:
+        for name in os.listdir(tmp_base):
+            if not name.startswith(("tspb-dl-", "tspb-up-")):
+                continue
+            p = os.path.join(tmp_base, name)
+            try:
+                if os.path.getmtime(p) < cutoff:
+                    os.remove(p)
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
 def start_chunk_reaper(app):
-    """Background daemon that reaps abandoned chunk staging dirs on a timer —
+    """Background daemon that reaps abandoned chunk staging dirs — and
+    orphaned transfer temp files under <DATA_DIR>/tmp — on a timer,
     independent of inbound traffic, so an idle service still cleans up (the old
     code only swept when a *new* chunk arrived). Called once from create_app."""
     base = os.path.join(app.config["DATA_DIR"], "upload-chunks")
+    tmp_base = os.path.join(app.config["DATA_DIR"], "tmp")
     interval = max(300, _CHUNK_TTL_SECONDS // 4)
 
     def _loop():
         while True:
             time.sleep(interval)
             _reap_stale_chunks(base, _CHUNK_TTL_SECONDS)
+            _reap_stale_tmp(tmp_base, _TMP_TTL_SECONDS)
 
     threading.Thread(target=_loop, name="tspb-chunk-reaper", daemon=True).start()
 
@@ -183,11 +234,42 @@ def _extract_key():
     return (request.headers.get("X-API-Key") or "").strip()
 
 
+# Failed-auth logging (key guessing / stuffing would otherwise be invisible),
+# rate-limited so a request flood can't turn the log into the DoS target: at
+# most _AUTHLOG_MAX warnings per _AUTHLOG_WINDOW seconds, then one notice.
+_AUTHLOG_WINDOW = 60
+_AUTHLOG_MAX = 20
+_authlog_lock = threading.Lock()
+_authlog_state = {"window_start": 0.0, "count": 0}
+
+
+def _log_auth_failure(key):
+    now = time.time()
+    with _authlog_lock:
+        if now - _authlog_state["window_start"] > _AUTHLOG_WINDOW:
+            _authlog_state["window_start"] = now
+            _authlog_state["count"] = 0
+        _authlog_state["count"] += 1
+        n = _authlog_state["count"]
+    if n <= _AUTHLOG_MAX:
+        # First 8 chars only — enough to tell a stale real key from garbage
+        # without ever logging usable key material.
+        current_app.logger.warning(
+            "API auth failed: ip=%s key_prefix=%r",
+            request.remote_addr, (key or "")[:8] or None)
+    elif n == _AUTHLOG_MAX + 1:
+        current_app.logger.warning(
+            "API auth failures continuing (%d in this window) — suppressing "
+            "further auth-failure logs for up to %ds", n, _AUTHLOG_WINDOW)
+
+
 def require_site(fn):
     @wraps(fn)
     def wrapper(*args, **kwargs):
-        site = Site.authenticate(_extract_key())
+        key = _extract_key()
+        site = Site.authenticate(key)
         if site is None:
+            _log_auth_failure(key)
             return jsonify(ok=False, error="invalid or missing API key"), 401
         # Debounce last_seen so a burst of requests (e.g. many chunk POSTs)
         # doesn't trigger a DB write per request on the shared SQLite file.
@@ -273,22 +355,55 @@ def register():
     token = (data.get("restore_token") or "").strip()
     enabled = str(data.get("restore_enabled", "")).strip().lower() in ("1", "true", "yes", "on")
 
-    if callback_url and not re.match(r"^https?://[^\s/]+", callback_url, re.I):
-        return jsonify(ok=False, error="callback_url must be an absolute http(s) URL"), 400
+    if callback_url:
+        parts = urlsplit(callback_url)
+        if parts.scheme.lower() not in ("http", "https") or not parts.hostname:
+            return jsonify(ok=False, error="callback_url must be an absolute http(s) URL"), 400
+        # No userinfo: 'https://evil@host' shapes are a redirect/confusion
+        # primitive and never legitimate for a site's own base URL.
+        if parts.username or parts.password or "@" in parts.netloc:
+            return jsonify(ok=False, error="callback_url must not contain credentials"), 400
+        # Admin pinned the expected restore host: the API key alone may not
+        # move the callback anywhere else.
+        pinned = (site.restore_url_pinned or "").strip().lower()
+        if pinned and (parts.hostname or "").lower() != pinned:
+            current_app.logger.warning(
+                "site %s (%s) tried to register restore callback host %r but the "
+                "console has pinned %r — rejected (ip %s)",
+                site.id, site.name, parts.hostname, pinned, request.remote_addr)
+            return jsonify(ok=False, error=(
+                "this server pins this site's restore callback host to "
+                f"{pinned!r}; ask the backup-server admin to update the pin "
+                "before re-registering a different host")), 403
 
     site.restore_enabled = enabled
     if enabled:
         if callback_url:
-            site.restore_callback_url = callback_url.rstrip("/")
+            new_url = callback_url.rstrip("/")
+            old_url = site.restore_callback_url
+            if old_url and old_url != new_url:
+                # Re-pointing the restore endpoint is exactly what a stolen
+                # API key would do — make it loud, never silent.
+                current_app.logger.warning(
+                    "site %s (%s) restore callback re-registered: %r -> %r (ip %s)",
+                    site.id, site.name, old_url, new_url, request.remote_addr)
+            else:
+                current_app.logger.info(
+                    "site %s (%s) registered restore callback %r (ip %s)",
+                    site.id, site.name, new_url, request.remote_addr)
+            site.restore_callback_url = new_url
         if token:
             site.set_restore_token(token)
         site.restore_registered_at = datetime.utcnow()
+        site.restore_registered_ip = request.remote_addr
     else:
         # Site turned remote restore off — forget how to reach it so a stale
         # URL/token can never be used.
         site.restore_callback_url = None
         site.set_restore_token(None)
         site.restore_registered_at = None
+        site.restore_registered_ip = None
+        site.restore_url_acked = None
     db.session.commit()
     return jsonify(ok=True, restore_enabled=site.restore_enabled)
 
@@ -364,37 +479,54 @@ def upload_chunk():
     if chunk is None:
         return jsonify(ok=False, error="missing 'chunk' part"), 400
 
-    staging = _chunk_staging_dir(g.site.id, upload_id)
-    dest = os.path.join(staging, f"{chunk_index:08d}.bin")
-    # Replacing an existing index shouldn't double-count toward the cap.
-    prior = os.path.getsize(dest) if os.path.exists(dest) else 0
-    chunk.save(dest)
-    csize = os.path.getsize(dest)
+    # Serialize save+check per upload: without the lock, concurrent chunk
+    # POSTs all read the same stale free-space figure and collectively
+    # overshoot it (TOCTOU) — and writing before any check at all would let
+    # the very write that breaches the margin land on disk first.
+    with _upload_lock(g.site.id, upload_id):
+        # Estimate BEFORE the bytes touch disk (request.content_length covers
+        # the multipart body, a slight over-estimate — safe direction).
+        est = request.content_length or CHUNK_MAX_BYTES
+        cap = _capacity_error(g.site, est)
+        if cap:
+            return jsonify(ok=False, error=cap[0]), cap[1]
 
-    # Per-chunk cap: a single chunk must not exceed the advertised max.
-    if csize > CHUNK_MAX_BYTES:
-        try:
-            os.remove(dest)
-        except OSError:
-            pass
-        return jsonify(ok=False, error=f"chunk exceeds max_chunk_mb ({CHUNK_MAX_MB} MiB)"), 413
+        staging = _chunk_staging_dir(g.site.id, upload_id)
+        dest = os.path.join(staging, f"{chunk_index:08d}.bin")
+        # Replacing an existing index shouldn't double-count toward the cap.
+        prior = os.path.getsize(dest) if os.path.exists(dest) else 0
+        chunk.save(dest)
+        csize = os.path.getsize(dest)
 
-    # Cumulative cap: the staged total for this upload can't exceed the
-    # logical backup ceiling — stops an unbounded pile of chunks filling disk.
-    staged_total = _staged_bytes(staging)
-    if staged_total > _max_backup_bytes():
-        try:
-            os.remove(dest)
-        except OSError:
-            pass
-        return jsonify(ok=False, error=(
-            f"upload exceeds the maximum backup size of "
-            f"{_max_backup_bytes() // _MiB} MiB")), 413
+        # Per-chunk cap: a single chunk must not exceed the advertised max.
+        if csize > CHUNK_MAX_BYTES:
+            try:
+                os.remove(dest)
+            except OSError:
+                pass
+            return jsonify(ok=False, error=f"chunk exceeds max_chunk_mb ({CHUNK_MAX_MB} MiB)"), 413
 
-    # Disk headroom: account for the eventual reassembled copy + this growth.
-    cap = _capacity_error(g.site, csize - prior)
-    if cap:
-        return jsonify(ok=False, error=cap[0]), cap[1]
+        # Cumulative cap: the staged total for this upload can't exceed the
+        # logical backup ceiling — stops an unbounded pile of chunks filling disk.
+        staged_total = _staged_bytes(staging)
+        if staged_total > _max_backup_bytes():
+            try:
+                os.remove(dest)
+            except OSError:
+                pass
+            return jsonify(ok=False, error=(
+                f"upload exceeds the maximum backup size of "
+                f"{_max_backup_bytes() // _MiB} MiB")), 413
+
+        # Exact post-save re-check: the estimate above can't see other sites'
+        # concurrent writes, so verify the real growth still fits.
+        cap = _capacity_error(g.site, csize - prior)
+        if cap:
+            try:
+                os.remove(dest)
+            except OSError:
+                pass
+            return jsonify(ok=False, error=cap[0]), cap[1]
 
     return jsonify(ok=True, upload_id=upload_id, chunk_index=chunk_index,
                    total_chunks=total_chunks)
@@ -419,56 +551,67 @@ def upload_finalize():
 
     staging = os.path.join(current_app.config["DATA_DIR"], "upload-chunks",
                           f"site-{site.id}", upload_id)
-    if not os.path.isdir(staging):
-        return jsonify(ok=False, error="upload session not found — re-upload the chunks"), 404
-    chunks = sorted(n for n in os.listdir(staging) if n.endswith(".bin"))
+    # Same lock as upload_chunk: two concurrent finalize POSTs for one
+    # upload_id would otherwise both assemble and create duplicate rows.
+    with _upload_lock(site.id, upload_id):
+        if not os.path.isdir(staging):
+            return jsonify(ok=False, error="upload session not found — re-upload the chunks"), 404
+        chunks = sorted(n for n in os.listdir(staging) if n.endswith(".bin"))
 
-    # total_chunks is MANDATORY: without it the old code would happily assemble
-    # whatever partial set was present into a "successful" but truncated backup
-    # that can't be decrypted at restore. Require it and a contiguous 0..N-1 set.
-    try:
-        expected = int(request.form.get("total_chunks", ""))
-    except ValueError:
-        return jsonify(ok=False, error="total_chunks is required"), 400
-    if expected < 1:
-        return jsonify(ok=False, error="total_chunks must be >= 1"), 400
-    want = [f"{i:08d}.bin" for i in range(expected)]
-    if chunks != want:
-        return jsonify(ok=False, error=(
-            f"upload incomplete or out of order — expected {expected} contiguous "
-            f"chunks but got {len(chunks)}; re-upload the missing parts")), 409
+        # total_chunks is MANDATORY: without it the old code would happily assemble
+        # whatever partial set was present into a "successful" but truncated backup
+        # that can't be decrypted at restore. Require it and a contiguous 0..N-1 set.
+        try:
+            expected = int(request.form.get("total_chunks", ""))
+        except ValueError:
+            return jsonify(ok=False, error="total_chunks is required"), 400
+        if expected < 1:
+            return jsonify(ok=False, error="total_chunks must be >= 1"), 400
+        want = [f"{i:08d}.bin" for i in range(expected)]
+        if chunks != want:
+            return jsonify(ok=False, error=(
+                f"upload incomplete or out of order — expected {expected} contiguous "
+                f"chunks but got {len(chunks)}; re-upload the missing parts")), 409
 
-    # Disk headroom for the reassembled copy before we write it.
-    reassembled = sum(os.path.getsize(os.path.join(staging, n)) for n in chunks)
-    cap = _capacity_error(site, reassembled)
-    if cap:
-        return jsonify(ok=False, error=cap[0]), cap[1]
+        # Disk headroom for PEAK usage, not just the logical size: while
+        # ingest runs, the staging chunks, the reassembled tmp file and the
+        # final stored copy all exist at once — staging is already on disk,
+        # so we still need room for two more copies.
+        reassembled = sum(os.path.getsize(os.path.join(staging, n)) for n in chunks)
+        cap = _capacity_error(site, reassembled, disk_bytes=2 * reassembled)
+        if cap:
+            return jsonify(ok=False, error=cap[0]), cap[1]
 
-    tmp = tempfile.NamedTemporaryFile(prefix="tspb-up-", suffix=".bin",
-                                      dir=storage.tmp_dir(current_app), delete=False)
-    try:
-        with open(tmp.name, "wb") as out:
-            for name in chunks:
-                with open(os.path.join(staging, name), "rb") as src:
-                    while True:
-                        block = src.read(8 * 1024 * 1024)
-                        if not block:
-                            break
-                        out.write(block)
-        tmp.close()
+        tmp = tempfile.NamedTemporaryFile(prefix="tspb-up-", suffix=".bin",
+                                          dir=storage.tmp_dir(current_app), delete=False)
+        try:
+            with open(tmp.name, "wb") as out:
+                for name in chunks:
+                    with open(os.path.join(staging, name), "rb") as src:
+                        while True:
+                            block = src.read(8 * 1024 * 1024)
+                            if not block:
+                                break
+                            out.write(block)
+            tmp.close()
 
-        why = _e2ee_gate_error(site, tmp.name)
-        if why:
-            return jsonify(ok=False, error=why), 422
+            why = _e2ee_gate_error(site, tmp.name)
+            if why:
+                return jsonify(ok=False, error=why), 422
 
-        backup = storage.ingest(site, scope, tmp.name, original_name, note=note)
-    except Exception as e:  # noqa: BLE001
-        current_app.logger.error("finalize ingest failed for site=%s: %s", site.id, e)
-        return jsonify(ok=False, error="failed to store backup"), 500
-    finally:
-        try: os.remove(tmp.name)
-        except OSError: pass
-        shutil.rmtree(staging, ignore_errors=True)
+            backup = storage.ingest(site, scope, tmp.name, original_name, note=note)
+        except Exception as e:  # noqa: BLE001
+            current_app.logger.error("finalize ingest failed for site=%s: %s", site.id, e)
+            return jsonify(ok=False, error="failed to store backup"), 500
+        finally:
+            try: os.remove(tmp.name)
+            except OSError: pass
+            shutil.rmtree(staging, ignore_errors=True)
+            # Staging is gone, so this upload_id is finished for good —
+            # only now is it safe to forget its lock. (Early validation
+            # returns above keep the entry: other chunk POSTs may still
+            # hold it.)
+            _drop_upload_lock(site.id, upload_id)
 
     return jsonify(ok=True, backup=_backup_json(backup)), 201
 

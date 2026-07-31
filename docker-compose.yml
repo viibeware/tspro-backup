@@ -22,6 +22,24 @@ services:
     # stop a compromised process from regaining privileges.
     security_opt:
       - no-new-privileges:true
+    # Drop every capability, then grant back only what the root entrypoint
+    # phase needs to fix /data ownership and drop to the 'app' user
+    # (docker-entrypoint.py). After the setuid, none of these are effective.
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - SETGID
+      - SETUID
+    # Cap memory so a runaway worker can't OOM the host. Transfers are
+    # streamed in 1 MiB blocks, so even multi-GB backups fit comfortably.
+    mem_limit: ${TSPB_MEM_LIMIT:-2g}
+    # Optional (strictest): make the image filesystem immutable. /data stays
+    # writable (volume) and gunicorn's worker heartbeat needs a writable /tmp.
+    # Uncomment both lines together:
+    #     read_only: true
+    #     tmpfs: [ /tmp ]
     environment:
       - TSPB_SECRET_KEY=${TSPB_SECRET_KEY:?TSPB_SECRET_KEY must be set in .env}
       - TSPB_ADMIN_USERNAME=${TSPB_ADMIN_USERNAME:-admin}

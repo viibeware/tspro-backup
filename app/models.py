@@ -16,7 +16,7 @@ Four tables:
 """
 import hashlib
 import secrets
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from flask_login import UserMixin
 from flask_sqlalchemy import SQLAlchemy
@@ -141,6 +141,64 @@ class Setting(db.Model):
         return row
 
 
+class OneTimeSecret(db.Model):
+    """Server-side stash backing the show-once credential reveal modal.
+
+    Flask sessions are client-side cookies — signed but NOT encrypted — so a
+    freshly minted API key or E2EE private key must never ride in one (any
+    cookie copy could be base64-decoded to the secret). Instead the secrets
+    are Fernet-encrypted into this table and the session carries only a
+    random nonce. The row is deleted on first read, and a TTL sweep clears
+    anything never picked up, so each secret transits exactly one response.
+    A table (not an in-process cache) so the reveal survives the multi-worker
+    gunicorn split."""
+    __tablename__ = "one_time_secret"
+    id = db.Column(db.Integer, primary_key=True)
+    nonce = db.Column(db.String(64), unique=True, nullable=False, index=True)
+    site_id = db.Column(db.Integer, index=True)
+    api_key_enc = db.Column(db.LargeBinary)
+    privkey_enc = db.Column(db.LargeBinary)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+    TTL_MINUTES = 15
+
+    @classmethod
+    def stash(cls, site_id, api_key=None, privkey=None) -> str:
+        """Store the secrets, return the nonce to put in the session."""
+        from .crypto import encrypt
+        cls._sweep()
+        nonce = secrets.token_urlsafe(32)
+        db.session.add(cls(
+            nonce=nonce, site_id=site_id,
+            api_key_enc=encrypt(api_key) if api_key else None,
+            privkey_enc=encrypt(privkey) if privkey else None))
+        db.session.commit()
+        return nonce
+
+    @classmethod
+    def pop(cls, nonce):
+        """One-shot read: return (site_id, api_key, privkey) and delete the
+        row, or None if the nonce is unknown/expired/already read."""
+        from .crypto import decrypt
+        cls._sweep()
+        if not nonce:
+            return None
+        row = cls.query.filter_by(nonce=nonce).first()
+        if row is None:
+            return None
+        out = (row.site_id,
+               decrypt(row.api_key_enc) if row.api_key_enc else None,
+               decrypt(row.privkey_enc) if row.privkey_enc else None)
+        db.session.delete(row)
+        db.session.commit()
+        return out
+
+    @classmethod
+    def _sweep(cls):
+        cutoff = datetime.utcnow() - timedelta(minutes=cls.TTL_MINUTES)
+        cls.query.filter(cls.created_at < cutoff).delete()
+
+
 class Site(db.Model):
     """A connected TS Pro instance."""
     __tablename__ = "site"
@@ -193,6 +251,17 @@ class Site(db.Model):
     restore_token_enc = db.Column(db.LargeBinary)
     restore_enabled = db.Column(db.Boolean, nullable=False, default=False)
     restore_registered_at = db.Column(db.DateTime)
+    restore_registered_ip = db.Column(db.String(45))
+    # The (url, token-hash) pair the operator last confirmed on the restore
+    # page. Anyone holding the site's API key can re-point the callback URL
+    # via /register, so the restore page compares the live pair against this
+    # and demands an explicit re-confirmation (typing the hostname) whenever
+    # they differ — a silently moved endpoint can't phish the private key.
+    restore_url_acked = db.Column(db.String(600))
+    # Admin-pinned expected callback host. When set, /register refuses to
+    # move the callback URL to any other host — a leaked API key alone can
+    # no longer steer restores off-site.
+    restore_url_pinned = db.Column(db.String(255))
 
     backups = db.relationship(
         "Backup", backref="site", cascade="all, delete-orphan",
@@ -259,6 +328,34 @@ class Site(db.Model):
         opted in and published both a callback URL and a token."""
         return bool(self.restore_enabled and self.restore_callback_url
                     and self.restore_token_enc)
+
+    def _restore_endpoint_pair(self):
+        """Canonical '<sha256(token)>|<url>' string identifying the current
+        restore endpoint. Token is hashed so the ack column never stores it."""
+        if not (self.restore_callback_url and self.restore_token_enc):
+            return None
+        token_hash = hashlib.sha256(self.restore_token.encode("utf-8")).hexdigest()
+        return f"{token_hash}|{self.restore_callback_url}"
+
+    @property
+    def restore_endpoint_changed(self) -> bool:
+        """True when the live callback URL/token differs from what the
+        operator last confirmed (or was never confirmed at all)."""
+        current = self._restore_endpoint_pair()
+        return bool(current) and current != self.restore_url_acked
+
+    def ack_restore_endpoint(self):
+        """Record that the operator verified the current endpoint."""
+        self.restore_url_acked = self._restore_endpoint_pair()
+
+    @property
+    def restore_host(self):
+        """Hostname of the registered callback URL (what the operator must
+        re-type to confirm a changed endpoint)."""
+        from urllib.parse import urlsplit
+        if not self.restore_callback_url:
+            return None
+        return (urlsplit(self.restore_callback_url).hostname or "").lower() or None
 
     # ── effective retention (override → default) ───────────────────
     def retention(self, settings):

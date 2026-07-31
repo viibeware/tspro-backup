@@ -1,0 +1,6 @@
+# Development / release tooling (not installed in the image).
+-r requirements.txt
+pytest
+# Release checklist: run `pip-audit -r requirements.txt` before tagging a
+# release so dependency advisories can't drift again (see SECURITY_AUDIT N3).
+pip-audit

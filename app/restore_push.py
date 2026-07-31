@@ -23,6 +23,7 @@ if any, is stripped by ``storage.open_for_download``). For E2EE sites that
 is the ``TSPEPK01`` envelope; the site decrypts it with the private key.
 """
 import os
+import re
 import uuid
 
 from . import storage
@@ -36,6 +37,33 @@ _CHUNK_BYTES = _CHUNK_MB * 1024 * 1024
 
 class RestorePushError(Exception):
     """Any failure pushing a restore to the site (network, auth, refusal)."""
+
+
+def _clean_filename(name):
+    """The multipart filename travels in an outbound header; CR/LF or other
+    control characters in a (client-supplied) original_name would corrupt the
+    request we build. Replace them, and quotes/backslashes, with '_'."""
+    return re.sub(r'[\x00-\x1f\x7f"\\]', "_", name) or "backup.bin"
+
+
+def _post(sess, url, *, headers, data, files=None, timeout):
+    """One restore POST. Never follows redirects: requests would replay the
+    X-Restore-Token header and the private_key form field to the redirect
+    target — including a plain-http one — so a 3xx is always an error here.
+    The https check runs per-request, not just on the stored base URL."""
+    debug = os.environ.get("TSPB_DEBUG", "").lower() in ("1", "true", "yes")
+    if not url.lower().startswith("https://") and not debug:
+        raise RestorePushError(
+            "refusing to push a restore over plain HTTP — the site's callback "
+            "URL must be https")
+    r = sess.post(url, headers=headers, data=data, files=files,
+                  allow_redirects=False, timeout=(10, timeout))
+    if 300 <= r.status_code < 400:
+        raise RestorePushError(
+            "site returned a redirect — fix the callback URL to the final "
+            "https address (restore credentials are never re-sent to a "
+            "redirect target)")
+    return r
 
 
 def _check(resp, what):
@@ -88,7 +116,7 @@ def push_restore(app, site, backup, private_key, *, timeout=120):
     if not token:
         raise RestorePushError("no restore token on file for this site; re-pair the site")
     headers = {"X-Restore-Token": token}
-    filename = backup.original_name or f"backup-{backup.id}.bin"
+    filename = _clean_filename(backup.original_name or f"backup-{backup.id}.bin")
     sess = requests.Session()
 
     path, is_temp = storage.open_for_download(app, backup)
@@ -99,6 +127,10 @@ def push_restore(app, site, backup, private_key, *, timeout=120):
                                  backup.scope, private_key, timeout)
         return _push_single(sess, base, headers, path, filename,
                             backup.scope, private_key, timeout)
+    except requests.Timeout as e:
+        raise RestorePushError(
+            "timed out waiting for the site — it may still be applying the "
+            "restore; check the site before retrying") from e
     except requests.RequestException as e:
         raise RestorePushError(f"could not reach the site: {e}") from e
     finally:
@@ -111,12 +143,12 @@ def push_restore(app, site, backup, private_key, *, timeout=120):
 
 def _push_single(sess, base, headers, path, filename, scope, private_key, timeout):
     with open(path, "rb") as fh:
-        r = sess.post(
-            f"{base}/api/v1/restore",
+        r = _post(
+            sess, f"{base}/api/v1/restore",
             headers=headers,
             data={"scope": scope, "filename": filename, "private_key": private_key},
             files={"file": (filename, fh, "application/octet-stream")},
-            timeout=None,  # large archives; no read timeout
+            timeout=timeout,
         )
     return _check(r, "restore")
 
@@ -130,21 +162,21 @@ def _push_chunked(sess, base, headers, path, size, filename, scope, private_key,
             block = fh.read(_CHUNK_BYTES)
             if not block:
                 break
-            r = sess.post(
-                f"{base}/api/v1/restore/chunk",
+            r = _post(
+                sess, f"{base}/api/v1/restore/chunk",
                 headers=headers,
                 data={"upload_id": upload_id, "chunk_index": index, "total_chunks": total},
                 files={"chunk": ("chunk", block, "application/octet-stream")},
-                timeout=None,
+                timeout=timeout,
             )
             _check(r, "restore chunk")
             index += 1
     # Private key + apply happen only on finalize, not on every chunk.
-    r = sess.post(
-        f"{base}/api/v1/restore/finalize",
+    r = _post(
+        sess, f"{base}/api/v1/restore/finalize",
         headers=headers,
         data={"upload_id": upload_id, "scope": scope, "filename": filename,
               "total_chunks": total, "private_key": private_key},
-        timeout=None,
+        timeout=timeout,
     )
     return _check(r, "restore finalize")

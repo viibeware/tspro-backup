@@ -3,6 +3,24 @@
 {% block page_title %}Remote restore{% endblock %}
 {% block content %}
 
+{% if endpoint_changed %}
+<div class="card danger-zone">
+  <div class="card-head"><h2>{{ icon('alert') }} Restore endpoint changed — verify before continuing</h2></div>
+  <p class="muted">
+    The restore endpoint for <strong>{{ site.name }}</strong> is
+    <code class="conn-val">{{ site.restore_callback_url }}</code>, which is <strong>not the endpoint
+    you last confirmed</strong> (or it was never confirmed). Anyone holding this site's API key can
+    re-register the endpoint, so a changed URL can mean a legitimate move — or an attempt to steer
+    this restore (and the private key you paste below) to a hostile server.
+  </p>
+  <p class="muted">
+    <strong>Verify out-of-band</strong> (call/message the site operator, check the TS Pro backup-target
+    settings) that <code class="conn-val">{{ expected_host }}</code> is really this site's host. To
+    proceed you must type that full hostname in the confirmation box instead of RESTORE.
+  </p>
+</div>
+{% endif %}
+
 <div class="card danger-zone">
   <div class="card-head"><h2>{{ icon('alert') }} Push this backup back to the live site</h2></div>
   <p class="muted">
@@ -41,8 +59,15 @@
     </label>
 
     <label class="field">
+      {% if endpoint_changed %}
+      <span>Type the endpoint hostname <strong>{{ expected_host }}</strong> to confirm <span class="req">*</span></span>
+      <input name="confirm" type="text" required autocomplete="off" placeholder="{{ expected_host }}">
+      <span class="muted small">Required because the endpoint changed since it was last confirmed —
+        typing the hostname records that you verified it.</span>
+      {% else %}
       <span>Type <strong>RESTORE</strong> to confirm <span class="req">*</span></span>
       <input name="confirm" type="text" required autocomplete="off" placeholder="RESTORE">
+      {% endif %}
     </label>
 
     <div class="form-actions">

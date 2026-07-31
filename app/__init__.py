@@ -14,7 +14,7 @@ fresh installs.
 """
 import os
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from flask import Flask
 from flask_login import LoginManager
@@ -81,6 +81,10 @@ def create_app():
         REMEMBER_COOKIE_SECURE=secure_cookies,
         REMEMBER_COOKIE_HTTPONLY=True,
         REMEMBER_COOKIE_SAMESITE="Lax",
+        # Flask-Login's default remember-me lifetime is 365 days — far too
+        # long for a bearer credential on a backup vault's console.
+        REMEMBER_COOKIE_DURATION=timedelta(
+            days=int(os.environ.get("TSPB_REMEMBER_DAYS", "14"))),
     )
 
     # Behind Caddy / Cloudflare: trust one proxy hop for scheme + client IP
@@ -321,6 +325,9 @@ def _migrate_sqlite(db):
             add("site", "restore_token_enc", "restore_token_enc BLOB")
             add("site", "restore_enabled", "restore_enabled BOOLEAN DEFAULT 0")
             add("site", "restore_registered_at", "restore_registered_at DATETIME")
+            add("site", "restore_registered_ip", "restore_registered_ip VARCHAR(45)")
+            add("site", "restore_url_acked", "restore_url_acked VARCHAR(600)")
+            add("site", "restore_url_pinned", "restore_url_pinned VARCHAR(255)")
         if "backup" in existing:
             add("backup", "client_encrypted", "client_encrypted BOOLEAN DEFAULT 0")
             add("backup", "note", "note VARCHAR(500)")

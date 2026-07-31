@@ -85,18 +85,33 @@ def ingest(site, scope, src_temp_path, original_name, note=None):
     stored_name = uuid.uuid4().hex + ".bin"
     dest = os.path.join(site_dir(app, site.id), stored_name)
 
+    # Write to a .part name and rename into place only when complete: a
+    # worker killed mid-write (disk full, SIGKILL at the 600s timeout) then
+    # leaves an obvious partial, never a plausible-looking .bin. On any
+    # failure the partial is removed so a dead write can't linger and eat
+    # the volume.
+    part = dest + ".part"
     encrypt_at_rest = site.effective_encrypt_at_rest(settings)
-    if encrypt_at_rest:
-        passphrase = restenc.resolve_rest_passphrase(app)
-        restenc.encrypt_file(src_temp_path, dest, passphrase)
-    else:
-        # Move/copy the raw bytes into place.
-        with open(src_temp_path, "rb") as src, open(dest, "wb") as out:
-            while True:
-                chunk = src.read(1024 * 1024)
-                if not chunk:
-                    break
-                out.write(chunk)
+    try:
+        if encrypt_at_rest:
+            passphrase = restenc.resolve_rest_passphrase(app)
+            restenc.encrypt_file(src_temp_path, part, passphrase)
+        else:
+            # Move/copy the raw bytes into place.
+            with open(src_temp_path, "rb") as src, open(part, "wb") as out:
+                while True:
+                    chunk = src.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    out.write(chunk)
+        os.replace(part, dest)
+    except Exception:
+        for stale in (part, dest):
+            try:
+                os.remove(stale)
+            except OSError:
+                pass
+        raise
 
     stored_bytes = os.path.getsize(dest)
     # Stored blobs are (E2EE / at-rest) ciphertext, but keep them owner-only

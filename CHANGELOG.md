@@ -5,6 +5,53 @@ All notable changes to **TS Pro Backup** are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.2] — 2026-07-31
+
+Security-hardening patch release focused on the remote-restore path.
+**Upgrades are safe and automatic** (additive schema migration on boot).
+
+### Security
+
+- **Restore pushes no longer follow HTTP redirects.** A site (or a proxy in
+  front of it) answering the restore push with a 30x used to be followed —
+  re-sending the restore token and the operator's private key to the redirect
+  target, potentially over plain HTTP. Any redirect is now a hard error, the
+  https requirement is enforced per request, and connect/read timeouts are
+  honored so a hung site can't pin worker threads.
+- **Changed restore endpoints require re-confirmation.** Anyone holding a
+  site's API key can re-register its restore callback URL. The restore page
+  now tracks the endpoint the operator last confirmed; if it changed (or was
+  never confirmed) a warning banner appears and the operator must type the
+  endpoint's full hostname — not just RESTORE — before a push is accepted.
+  Admins can additionally **pin** the expected callback host per site, every
+  (re)registration is logged with old→new URL and origin IP, and
+  registration URLs containing credentials are rejected.
+- **Show-once secrets no longer transit the session cookie.** Newly issued
+  API keys and E2EE private keys were stashed in the (signed but unencrypted)
+  client-side session cookie for the reveal modal. They now live in a
+  server-side one-time store — Fernet-encrypted, deleted on first read,
+  15-minute TTL — and the cookie carries only a random nonce.
+- **Dependency updates.** Flask 3.1.3, Werkzeug 3.1.6, cryptography 48.0.1,
+  requests 2.33.0 — clearing all known advisories reported by `pip-audit`.
+- **Upload capacity checks are race-free and count peak usage.** Chunk
+  uploads are checked against free-disk headroom *before* bytes land on disk
+  and are serialized per upload; finalize accounts for staging + reassembled
+  + stored copies existing at once; stored blobs are written via a `.part`
+  name and renamed only when complete, with partials removed on failure.
+- **Hygiene.** Failed API authentications are logged (IP + 8-char key prefix,
+  rate-limited); deleting a site also removes its staged chunk uploads; the
+  background reaper now sweeps orphaned transfer temp files from the data
+  volume; outbound restore filenames are stripped of control characters; the
+  console “remember me” cookie now lasts 14 days (was 365, tunable via
+  `TSPB_REMEMBER_DAYS`); the compose file drops all container capabilities
+  except the four the entrypoint needs and caps container memory.
+
+### Added
+
+- A `tests/` pytest suite covering the regressions above (redirect refusal,
+  endpoint re-confirmation, reveal-once semantics, capacity/cleanup/reaper
+  behaviour, auth-failure logging).
+
 ## [1.3.1] — 2026-07-04
 
 Maintenance release. Moves the project's GitHub repository and Docker Hub

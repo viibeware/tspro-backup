@@ -77,6 +77,21 @@
     </label>
   </fieldset>
 
+  <fieldset class="fieldset">
+    <legend>{{ icon('refresh') }} Remote-restore callback pin</legend>
+    <label class="field">
+      <span>Pin the expected restore callback host (optional)</span>
+      <input name="restore_url_pinned" type="text" {{ 'disabled' if not current_user.is_admin() }}
+             value="{{ site.restore_url_pinned or '' if site else '' }}" placeholder="e.g. portal.example.org">
+      <span class="muted small">The site registers its restore endpoint using only its API key, so a
+        leaked key could re-point restores (and the private key you paste during one) at another
+        server. Pinning a host here makes this server reject any registration for a different host.
+        Leave blank to allow the site to move freely (changes still require re-confirmation at
+        restore time).</span>
+      {% if not current_user.is_admin() %}<span class="muted small">Only admins can change the pinned host.</span>{% endif %}
+    </label>
+  </fieldset>
+
   <div class="form-actions">
     <button class="btn btn-primary" type="submit">{{ 'Save changes' if site else 'Create site' }}</button>
     <a class="btn btn-ghost" href="{{ url_for('main.sites') }}">Cancel</a>
@@ -127,9 +142,16 @@
       {% elif site.restore_enabled %}<span class="badge badge-warn">{{ icon('alert') }} Enabled, awaiting registration</span>
       {% else %}<span class="badge badge-warn">Not enabled by the site</span>{% endif %}
     </td></tr>
-    {% if site.restore_callback_url %}<tr><th>Callback URL</th><td><code class="conn-val">{{ site.restore_callback_url }}</code></td></tr>{% endif %}
-    <tr><th>Last registered</th><td title="{{ site.restore_registered_at | fmt_dt }}">{{ site.restore_registered_at | ago }}</td></tr>
+    {% if site.restore_callback_url %}<tr><th>Callback URL</th><td><code class="conn-val">{{ site.restore_callback_url }}</code>
+      {% if site.restore_endpoint_changed %}<span class="badge badge-warn">{{ icon('alert') }} not yet confirmed</span>{% endif %}
+    </td></tr>{% endif %}
+    {% if site.restore_url_pinned %}<tr><th>Pinned host</th><td><code class="conn-val">{{ site.restore_url_pinned }}</code></td></tr>{% endif %}
+    <tr><th>Last registered</th><td title="{{ site.restore_registered_at | fmt_dt }}">{{ site.restore_registered_at | ago }}{% if site.restore_registered_ip %} <span class="muted small">from {{ site.restore_registered_ip }}</span>{% endif %}</td></tr>
   </table>
+  <p class="muted small">⚠️ The site (re)registers this endpoint using only its API key. If that key
+    ever leaks, rotate it <strong>and</strong> re-verify the callback URL above before running any
+    restore — a stolen key can silently re-point where restores (and the private key typed during
+    one) are sent.</p>
   {% if site.restore_ready %}
   <p class="muted small">Restore a specific backup from the <a href="{{ url_for('main.backups', site=site.id, scope='full') }}">Backups</a> list — you'll be asked for this site's private key and a typed confirmation.</p>
   {% else %}

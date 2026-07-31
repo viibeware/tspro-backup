@@ -5,6 +5,7 @@ All gated by login. The console is the operator's view; TS Pro instances
 never touch these routes (they use the ``/api/v1`` blueprint).
 """
 import os
+import shutil
 from functools import wraps
 
 from flask import (Blueprint, abort, current_app, flash, jsonify, redirect,
@@ -12,7 +13,8 @@ from flask import (Blueprint, abort, current_app, flash, jsonify, redirect,
 from flask_login import current_user, login_required, login_user
 
 from .crypto import encrypt
-from .models import (SCOPE_LABELS, SCOPES, AdminUser, Backup, Setting, Site, db)
+from .models import (SCOPE_LABELS, SCOPES, AdminUser, Backup, OneTimeSecret,
+                     Setting, Site, db)
 from . import storage
 
 bp = Blueprint("main", __name__)
@@ -85,9 +87,13 @@ def dashboard():
 def sites():
     rows = Site.query.order_by(Site.name).all()
     settings = Setting.get()
-    new_key = session.pop("new_api_key", None)
-    new_privkey = session.pop("new_e2ee_privkey", None)
-    new_key_site = session.pop("new_api_key_site", None)
+    # One-time reveal: the session holds only a nonce; the secrets live
+    # server-side and are destroyed on this first (and only) read.
+    new_key = new_privkey = new_key_site = None
+    session.pop("key_reveal_site", None)
+    reveal = OneTimeSecret.pop(session.pop("key_reveal", None))
+    if reveal:
+        new_key_site, new_key, new_privkey = reveal
     # Fingerprint of the just-created/rotated site, for the reveal modal.
     new_site = next((s for s in rows if s.id == new_key_site), None) if new_key_site else None
     new_fingerprint = new_site.e2ee_fingerprint if new_site else None
@@ -110,9 +116,9 @@ def site_new():
         privkey = site.issue_keypair()
         db.session.add(site)
         db.session.commit()
-        session["new_api_key"] = raw_key
-        session["new_e2ee_privkey"] = privkey
-        session["new_api_key_site"] = site.id
+        session["key_reveal"] = OneTimeSecret.stash(site.id, api_key=raw_key,
+                                                    privkey=privkey)
+        session["key_reveal_site"] = site.id
         flash(f"Site “{name}” created. Copy its API key and private key now — neither is shown again.", "success")
         return redirect(url_for("main.sites"))
     return render_template("site_edit.html", site=None, settings=Setting.get())
@@ -133,13 +139,15 @@ def site_edit(site_id):
         flash("Site updated", "success")
         return redirect(url_for("main.site_edit", site_id=site_id))
     # Surface a freshly rotated key once, on this page (set by
-    # site_rotate_key / site_rotate_keypair).
+    # site_rotate_key / site_rotate_keypair). Session holds only a nonce;
+    # the one-shot pop destroys the server-side copy.
     new_key = None
     new_privkey = None
-    if session.get("new_api_key_site") == site.id:
-        new_key = session.pop("new_api_key", None)
-        new_privkey = session.pop("new_e2ee_privkey", None)
-        session.pop("new_api_key_site", None)
+    if session.get("key_reveal_site") == site.id:
+        session.pop("key_reveal_site", None)
+        reveal = OneTimeSecret.pop(session.pop("key_reveal", None))
+        if reveal:
+            _, new_key, new_privkey = reveal
     new_fingerprint = site.e2ee_fingerprint if (new_key or new_privkey) else None
     return render_template("site_edit.html", site=site, settings=Setting.get(),
                            new_key=new_key, new_privkey=new_privkey,
@@ -161,6 +169,13 @@ def _apply_site_form(site):
         site.encrypt_at_rest = {"on": True, "off": False}.get(enc, None)
         e2ee = request.form.get("require_e2ee", "inherit")
         site.require_e2ee = {"on": True, "off": False}.get(e2ee, None)
+        # Pin the restore callback host (admin-only, like the encryption
+        # policy): while set, /register can't move restores to another host.
+        pinned = (request.form.get("restore_url_pinned") or "").strip()
+        if "://" in pinned:  # accept a pasted URL, keep only its host
+            from urllib.parse import urlsplit
+            pinned = urlsplit(pinned).hostname or ""
+        site.restore_url_pinned = pinned.lower() or None
 
 
 @bp.route("/sites/<int:site_id>/rotate-key", methods=["POST"])
@@ -170,8 +185,8 @@ def site_rotate_key(site_id):
     site = Site.query.get_or_404(site_id)
     raw_key = site.issue_api_key()
     db.session.commit()
-    session["new_api_key"] = raw_key
-    session["new_api_key_site"] = site.id
+    session["key_reveal"] = OneTimeSecret.stash(site.id, api_key=raw_key)
+    session["key_reveal_site"] = site.id
     flash("API key rotated. The previous key no longer works.", "success")
     return redirect(url_for("main.site_edit", site_id=site.id))
 
@@ -183,8 +198,8 @@ def site_rotate_keypair(site_id):
     site = Site.query.get_or_404(site_id)
     privkey = site.issue_keypair()
     db.session.commit()
-    session["new_e2ee_privkey"] = privkey
-    session["new_api_key_site"] = site.id
+    session["key_reveal"] = OneTimeSecret.stash(site.id, privkey=privkey)
+    session["key_reveal_site"] = site.id
     flash("Encryption keypair rotated. New backups use the new key; keep the "
           "OLD private key to decrypt backups already stored.", "success")
     return redirect(url_for("main.site_edit", site_id=site.id))
@@ -208,6 +223,10 @@ def site_delete(site_id):
     app = current_app._get_current_object()
     for b in list(site.backups):
         storage.delete_blob(app, b)
+    # Also drop any staged chunk uploads — deleting the rows/blobs alone
+    # would leave those bytes on disk until the TTL reaper found them.
+    shutil.rmtree(os.path.join(app.config["DATA_DIR"], "upload-chunks",
+                               f"site-{site.id}"), ignore_errors=True)
     name = site.name
     db.session.delete(site)
     db.session.commit()
@@ -276,10 +295,25 @@ def backup_restore(backup_id):
               "and registered with this server.", "danger")
         return redirect(url_for("main.backups"))
 
+    # The restore endpoint is malleable by whoever holds the site's API key
+    # (POST /api/v1/register). If it changed since the operator last confirmed
+    # it — or was never confirmed — demand they re-type the full hostname, not
+    # just RESTORE, so a silently re-pointed URL can't phish the private key.
+    endpoint_changed = site.restore_endpoint_changed
+    expected_host = site.restore_host
+
     if request.method == "POST":
         private_key = (request.form.get("private_key") or "").strip()
         confirm = (request.form.get("confirm") or "").strip().lower()
-        if confirm != "restore":
+        if endpoint_changed:
+            if confirm != expected_host:
+                flash("The restore endpoint changed since it was last confirmed — "
+                      f"verify it out-of-band, then type its full hostname "
+                      f"(“{expected_host}”) to confirm.", "danger")
+                return redirect(url_for("main.backup_restore", backup_id=backup.id))
+            site.ack_restore_endpoint()
+            db.session.commit()
+        elif confirm != "restore":
             flash("Type RESTORE to confirm overwriting the live site.", "danger")
             return redirect(url_for("main.backup_restore", backup_id=backup.id))
         if not private_key:
@@ -300,7 +334,9 @@ def backup_restore(backup_id):
               "recycling its workers; give it a moment, then sign in there.", "success")
         return redirect(url_for("main.backups"))
 
-    return render_template("backup_restore.html", backup=backup, site=site)
+    return render_template("backup_restore.html", backup=backup, site=site,
+                           endpoint_changed=endpoint_changed,
+                           expected_host=expected_host)
 
 
 @bp.route("/backups/<int:backup_id>/delete", methods=["POST"])
